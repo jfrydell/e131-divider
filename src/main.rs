@@ -5,11 +5,30 @@ use std::{
 };
 
 use tokio::{net::UdpSocket, sync::RwLock};
+use tracing::{debug, trace};
+
+const FPS: usize = 20;
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
+    // Initialize the state
+    let state = Arc::new(RwLock::new(State::new(5, 100, FPS, 10 * FPS)));
+    // Listen for incoming E1.31 packets
     let e131_socket = UdpSocket::bind("0.0.0.0:5568").await.unwrap();
-    loop {}
+    tokio::spawn(handle_incoming(state.clone(), e131_socket));
+    // Run the main loop
+    let output_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    output_socket.connect("127.0.0.1:558").await.unwrap();
+    loop {
+        debug!("Frame {}", state.read().await.frame);
+        let frame_end = tokio::time::sleep(std::time::Duration::from_secs_f64(1.0 / FPS as f64));
+        let mut state = state.write().await;
+        run_frame(&mut state, &output_socket).await;
+        drop(state);
+        frame_end.await;
+    }
 }
 
 /// Performs one frame of the main loop.
@@ -18,17 +37,13 @@ async fn main() {
 /// - Locking the state `RwLock` so we can update the queues / read stable data
 /// - Sending the current frame's data to the physical controller
 /// - Updating the queue and current outputters, including adding newcomers to the queue
-pub async fn run_frame(state: &mut State, output: UdpSocket) {
+pub async fn run_frame(state: &mut State, output: &UdpSocket) {
     // Assemble the data for this frame (done before queue update because data isn't stored for queued controllers)
-    let mut data = [0u8; 510];
-    for outputter in &state.outputters {
+    let mut data = [0u8; 512];
+    for (i, outputter) in state.outputters.iter().enumerate() {
         let source = state.sources.get_mut(outputter).unwrap().get_mut().unwrap();
-        let (i, source_data) = match &source.position {
-            SourcePosition::Outputting {
-                position,
-                current_data,
-                ..
-            } => (position, current_data),
+        let source_data = match &source.position {
+            SourcePosition::Outputting { current_data, .. } => current_data,
             SourcePosition::Queue => unreachable!(),
         };
         data[i * state.input_channel_count..(i + 1) * state.input_channel_count]
@@ -42,7 +57,7 @@ pub async fn run_frame(state: &mut State, output: UdpSocket) {
     // Add any new sources to the queue. If a source is already in the `sources` map, it must be a duplicate (as it would have been added on a previous iteration), so it is ignored.
     for (addr, source_state) in state.new_sources.get_mut().unwrap().drain(..) {
         // Add the source to the `HashMap`, and to the queue if it isn't a duplicate
-        if state
+        if !state
             .sources
             .insert(addr, Mutex::new(source_state))
             .is_some()
@@ -50,8 +65,9 @@ pub async fn run_frame(state: &mut State, output: UdpSocket) {
             state.queue.push_back(addr);
         }
     }
+    trace!("Added new sources. Queue size: {}", state.queue.len());
 
-    // Remove any sources that have disconnected (last packet was prior to `state.timeout`)
+    // Remove any sources that have disconnected (last packet was more than `state.timeout` ago)
     let mut i = 0;
     while i < state.queue.len() {
         let addr = state.queue[i];
@@ -63,53 +79,138 @@ pub async fn run_frame(state: &mut State, output: UdpSocket) {
             i += 1;
         }
     }
-    i = 0;
-    while i < state.outputters.len() {
-        let addr = state.outputters[i];
-        let source = state.source(&addr);
+    trace!(
+        "Removed disconnected sources. Queue size: {}",
+        state.queue.len()
+    );
+
+    // Updating outputters is a bit complex for a few reasons. Firstly, we want the positions in `state.outputters` to be stable as long as
+    // it doesn't shrink, so we must swap out removed outputters with queued sources. Secondly, any timed out outputters must be removed, even
+    // if no sources are queued. Finally, if we are not at outputter capacity, we can add sources from the queue to the outputters. Any changes
+    // to the number of outputters must be followed by an update to the `input_channel_count`, as well as updating all output data.
+    // Flag for number of outputters changing:
+    let mut outputter_count_changed = false;
+    #[derive(PartialEq, PartialOrd, Eq, Ord)]
+    struct Outputter {
+        addr: SocketAddr,
+        position: usize,
+    }
+    // Find any outputters that must be removed due to disconnection
+    let mut timed_out_outputters = vec![];
+    for (position, &addr) in state.outputters.iter().enumerate() {
+        let source = state.sources.get_mut(&addr).unwrap().get_mut().unwrap();
         if source.last_packet + state.timeout < state.frame {
-            state.outputters.remove(i);
-        } else {
-            i += 1;
+            timed_out_outputters.push(Outputter { addr, position });
         }
     }
 
-    // Find all outputters that have reached the maximum output time
+    // Find any outputters that have reached the maximum output time
     let mut done_outputters = vec![];
-    for &addr in &state.outputters {
+    for (position, &addr) in state.outputters.iter().enumerate() {
         let source_state = &state.sources.get_mut(&addr).unwrap().get_mut().unwrap();
         let start_frame = match source_state.position {
             SourcePosition::Outputting { start_frame, .. } => start_frame,
             SourcePosition::Queue => unreachable!(),
         };
         if start_frame + state.output_time <= state.frame {
-            done_outputters.push((addr, start_frame));
+            done_outputters.push(Outputter { addr, position });
         }
     }
-    done_outputters.sort_by_key(|(_, start_frame)| *start_frame);
 
-    // Move outputters that have reached the maximum output time to the back of the queue (but only if there's others waiting)
-    for (addr, _) in done_outputters.drain(..).take(state.queue.len()) {
-        state.source(&addr).position = SourcePosition::Queue;
-        state.queue.push_back(addr);
-    }
-
-    // TODO: track empty slots? probably necessary. could also do position based on location in vector, so outputters move up as they're around longer. could be good?
-
-    // Fill any empty outputter slots with sources from the queue
-    for addr in state.queue.drain(..EMPTY_SLOT_COUNT) {
-        state.outputters.push(addr);
-        // Update the source positions to reflect the change
-        state.source(&addr).position = SourcePosition::Outputting {
+    // Remove timed out outputters that can be replaced with queued sources
+    for i in timed_out_outputters.drain(..state.queue.len().min(done_outputters.len())) {
+        let new_addr = state.queue.pop_front().unwrap();
+        state.outputters[i.position] = new_addr;
+        state.source(&new_addr).position = SourcePosition::Outputting {
             start_frame: state.frame,
             current_data: vec![0; state.input_channel_count],
-            position: CORRECT_POSITION,
         };
-        state.source(&addr).position = SourcePosition::Queue;
+        state.sources.remove(&i.addr);
+    }
+    if timed_out_outputters.len() > 0 {
+        // The queue is empty, but there are still timed out outputters. Remove them in inverse order (so the indices don't change)
+        timed_out_outputters.sort_by_key(|i| i.position);
+        for i in timed_out_outputters.into_iter().rev() {
+            state.outputters.remove(i.position);
+            state.sources.remove(&i.addr);
+        }
+        outputter_count_changed = true;
+    } else {
+        // The queue isn't empty, so we must remove outputters that have reached the maximum output time
+        for i in done_outputters.drain(..state.queue.len().min(done_outputters.len())) {
+            let new_addr = state.queue.pop_front().unwrap();
+            state.outputters[i.position] = new_addr;
+            state.source(&new_addr).position = SourcePosition::Outputting {
+                start_frame: state.frame,
+                current_data: vec![0; state.input_channel_count],
+            };
+            state.queue.push_back(i.addr);
+            state.source(&i.addr).position = SourcePosition::Queue;
+        }
+        // If there are sources queued, we can try and expand the number of outputters to accommodate them
+        if !state.queue.is_empty() && state.outputters.len() < state.outputter_capacity {
+            for addr in state
+                .queue
+                .drain(..state.outputter_capacity.min(state.queue.len()))
+            {
+                state.outputters.push(addr);
+                state
+                    .sources
+                    .get_mut(&addr)
+                    .unwrap()
+                    .get_mut()
+                    .unwrap()
+                    .position = SourcePosition::Outputting {
+                    start_frame: state.frame,
+                    // We don't need to initialize `current_data` here, as it will be overwritten due to the change in outputter count affecting `input_channel_count`.
+                    current_data: vec![],
+                };
+            }
+            outputter_count_changed = true;
+        }
+    }
+
+    // If the number of outputters has changed, we must update the `input_channel_count` and output data
+    if outputter_count_changed {
+        state.input_channel_count =
+            calculate_input_channel_count(state.output_channel_count, state.outputters.len());
+        for addr in &state.outputters {
+            match state
+                .sources
+                .get_mut(&addr)
+                .unwrap()
+                .get_mut()
+                .unwrap()
+                .position
+            {
+                SourcePosition::Outputting {
+                    ref mut current_data,
+                    ..
+                } => {
+                    current_data.resize(state.input_channel_count, 0);
+                }
+                SourcePosition::Queue => unreachable!(),
+            }
+        }
+    }
+
+    trace!("Outputting Sources:");
+    for addr in state.outputters.iter() {
+        let source = state.sources.get_mut(&addr).unwrap().get_mut().unwrap();
+        trace!("\t{addr} ({}): {:?}", source.name, source.position)
     }
 
     // Increment frame counter
     state.frame += 1;
+}
+
+/// Calculates how many input channels are required per source to support the given number of output channels and outputters.
+fn calculate_input_channel_count(output_channels: usize, output_count: usize) -> usize {
+    if output_count == 0 {
+        return 0;
+    }
+    let naive_count = output_channels / output_count;
+    naive_count - naive_count % 3
 }
 
 /// Handles all incoming packets.
@@ -133,7 +234,7 @@ async fn handle_incoming(state: Arc<RwLock<State>>, socket: UdpSocket) {
 async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
     // Get packet data
     let Some((name, _, data)) = validate(&data) else {return;};
-    println!("Received packet from {addr} ({name})");
+    trace!("Received packet from {addr} ({name})");
     // Lookup source
     match state.sources.get(addr) {
         Some(source_state) => {
@@ -145,8 +246,8 @@ async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
                     ref mut current_data,
                     ..
                 } => {
-                    current_data[0..data.len().min(state.input_channel_count)]
-                        .copy_from_slice(&data);
+                    let to_copy = data.len().min(current_data.len());
+                    current_data[..to_copy].copy_from_slice(&data[..to_copy]);
                 }
                 SourcePosition::Queue => {}
             }
@@ -160,7 +261,7 @@ async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
                     last_packet: state.frame,
                     position: SourcePosition::Queue,
                 },
-            ))
+            ));
         }
     }
 }
@@ -168,7 +269,7 @@ async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
 /// Sends an E1.31 packet on the given socket.
 async fn send_e131(
     socket: &UdpSocket,
-    data: &[u8; 510],
+    data: &[u8; 512],
     universe: u16,
     seq_number: u8,
 ) -> std::io::Result<usize> {
@@ -289,13 +390,18 @@ pub struct State {
     sources: HashMap<SocketAddr, Mutex<SourceState>>,
     /// A queue of sources that are waiting to output.
     queue: VecDeque<SocketAddr>,
-    /// A list of sources that are currently outputting.
+    /// A list of sources that are currently outputting, which preserves order (corresponds to positions in actual output).
     outputters: Vec<SocketAddr>,
     /// A list of new sources that have been added since the last frame. Unlike the `sources` map,
     /// this whole thing is wrapped in a `Mutex` to allow for new sources to be added with shared
     /// access to state.
     new_sources: Mutex<Vec<(SocketAddr, SourceState)>>,
-    /// The amount of channels each source is entitled to.
+    /// The maximum number of outputters we allow.
+    outputter_capacity: usize,
+    /// The total number of channels we output.
+    output_channel_count: usize,
+    /// The current number of channels we take from each source. This is at most `output_channel_count / outputters.len()`. However, it may be less
+    /// due to maintaining a multiple of 3 channels per outputter.
     input_channel_count: usize,
     /// The number of frames of inactivity before a source is removed.
     timeout: usize,
@@ -305,6 +411,27 @@ pub struct State {
     frame: usize,
 }
 impl State {
+    /// Creates a new `State` with the given configuration.
+    pub fn new(
+        outputter_capacity: usize,
+        output_channel_count: usize,
+        timeout: usize,
+        output_time: usize,
+    ) -> Self {
+        Self {
+            sources: HashMap::new(),
+            queue: VecDeque::new(),
+            outputters: Vec::new(),
+            new_sources: Mutex::new(Vec::new()),
+            outputter_capacity,
+            output_channel_count,
+            // We start with 0 input channels, as we have no outputters yet.
+            input_channel_count: 0,
+            timeout,
+            output_time,
+            frame: 0,
+        }
+    }
     /// Convenience function for getting a `SourceState` by `SocketAddr` with mutable access, which doesn't require locking.
     /// Panics if the source doesn't exist.
     ///
@@ -330,8 +457,6 @@ pub struct SourceState {
 pub enum SourcePosition {
     Queue,
     Outputting {
-        /// The output position of the source.
-        position: usize,
         /// The frame at which the source started outputting.
         start_frame: usize,
         /// The current data being output. The length of this is guaranteed to be equal to `input_channel_count`.

@@ -118,7 +118,7 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
     }
 
     // Remove timed out outputters that can be replaced with queued sources
-    for i in timed_out_outputters.drain(..state.queue.len().min(done_outputters.len())) {
+    for i in timed_out_outputters.drain(..state.queue.len().min(timed_out_outputters.len())) {
         let new_addr = state.queue.pop_front().unwrap();
         state.outputters[i.position] = new_addr;
         state.source(&new_addr).position = SourcePosition::Outputting {

@@ -30,7 +30,7 @@
     </li>
     <li>
       <h3>Does this support _____?</h3>
-      <p>If _____ is one-universe E1.31 data packets, then yes. Otherwise (output to more than one universe, Universe Synchronization, Universe Discovery, Protection against XSS attacks via E1.31 packet names, etc.) no.</p>
+      <p>If _____ is one-universe E1.31 data packets, then yes. Otherwise (output to more than one universe, Universe Synchronization, Universe Discovery, Protection against XSS attacks via E1.31 Source names, etc.) no.</p>
     </li>
   </ul>
   <h2>Current Status</h2>
@@ -65,13 +65,21 @@
   <ol id="currently-queued">
     <li>None</li>
   </ol>
+  <h2>Update Interval</h2>
+  <input type="number" min="100" id="update_ms" value="500" /> <label for="update_ms">ms</label>
 </body>
 
 <script>
   async function update() {
     // Get state
-    const response = await fetch('/state');
-    const data = await response.json();
+    try {
+      var response = await fetch('/state');
+      var data = await response.json();
+    } catch {
+      alert("Failed to connect to server. Click OK to retry in 5 seconds, or try refreshing the page.");
+      setTimeout(update, 5000);
+      return;
+    }
 
     // Basic data update
     const basic_stuff = ["frame", "outputter_capacity", "output_time", "output_channel_count", "input_channel_count", "timeout"];
@@ -112,7 +120,15 @@
       li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
       currentlyQueued.appendChild(li);
     });
-    setTimeout(update, 500);
+    setTimeout(update, get_update_interval());
+  }
+  function get_update_interval() {
+    let val = document.getElementById('update_ms').value;
+    if (val < 100) {
+      val = 100;
+      document.getElementById('update_ms').value = val;
+    }
+    return val;
   }
   document.addEventListener('DOMContentLoaded', () => {
     update();

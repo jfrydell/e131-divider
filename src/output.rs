@@ -135,8 +135,15 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
 
     // If the number of outputters has changed, we must update the `input_channel_count` and output data
     if outputter_count_changed {
-        state.input_channel_count =
-            calculate_input_channel_count(state.output_channel_count, state.outputters.len());
+        // Calculate channel count aligned to group size
+        state.input_channel_count = if state.outputters.len() == 0 {
+            state.output_channel_count
+        } else {
+            let naive_count = state.output_channel_count / state.outputters.len();
+            naive_count - naive_count % state.channel_group_size
+        };
+
+        // Update output data arrays
         for source in state.outputters.iter_mut() {
             source.data.resize(state.input_channel_count, 0);
         }
@@ -149,15 +156,6 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
 
     // Increment frame counter
     state.frame += 1;
-}
-
-/// Calculates how many input channels are required per source to support the given number of output channels and outputters.
-fn calculate_input_channel_count(output_channels: usize, output_count: usize) -> usize {
-    if output_count == 0 {
-        return 0;
-    }
-    let naive_count = output_channels / output_count;
-    naive_count - naive_count % 3
 }
 
 /// Sends an E1.31 packet on the given socket.

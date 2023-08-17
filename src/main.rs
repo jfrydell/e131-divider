@@ -5,6 +5,7 @@ use std::{
     time::Instant,
 };
 
+use gumdrop::Options;
 use serde::Serialize;
 use tokio::{net::UdpSocket, sync::Mutex};
 use tracing::debug;
@@ -15,13 +16,15 @@ mod website;
 
 #[tokio::main]
 async fn main() {
+    // Parse config
+    let opts = Args::parse_args_default_or_exit();
+
     // Initialize tracing
     tracing_subscriber::fmt::init();
-    // Set fps
-    let fps = 20;
     // Initialize the state. Uses `Mutex` because both input thread and main thread need write access
     // (initially had interior mutability for different sources, but input thread can't actually process packets concurrently (each packet is processsed ~instantly with no awaiting))
-    let state = Arc::new(Mutex::new(State::new(2, 100, 2 * fps, 20 * fps)));
+    let state = Arc::new(Mutex::new(State::new(&opts)));
+
     // Start the webserver
     tokio::spawn(website::main(Arc::clone(&state)));
     // Listen for incoming E1.31 packets
@@ -32,13 +35,12 @@ async fn main() {
     output_socket.connect("192.168.168.200:5568").await.unwrap();
 
     // Run the main loop
-    let fps = fps as f64;
-    let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / fps));
+    let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / opts.fps));
     loop {
         // Lock the state to start the frame (stops input thread)
         let mut state = state.lock().await;
+        let frame_count = state.frame;
         let frame_start = Instant::now();
-        debug!("Frame {}", state.frame);
 
         // Run the frame and measure total time
         output::run_frame(&mut state, &output_socket).await;
@@ -53,14 +55,32 @@ async fn main() {
 
         // Logging
         debug!(
-            "Frame utilization: {}\t({}% utilization)",
+            "Frame {frame_count} utilization: {}\t({}% utilization)",
             frame_time.as_secs_f64(),
-            frame_time.as_secs_f64() * fps * 100.0
+            frame_time.as_secs_f64() * opts.fps * 100.0
         );
 
         // Wait for next frame
         clock.tick().await;
     }
+}
+
+#[derive(Options)]
+struct Args {
+    #[options(help = "Prints help information")]
+    help: bool,
+    #[options(help = "The number of output channels to use", required, short = "c")]
+    output_channels: usize,
+    #[options(help = "The size of an indivisible group of channels", default = "3")]
+    group_size: usize,
+    #[options(help = "The framerate to run at", default = "20")]
+    fps: f64,
+    #[options(help = "The inactivity timeout in seconds", default = "2")]
+    timeout: f64,
+    #[options(help = "The output timeout in seconds", default = "20")]
+    output_time: f64,
+    #[options(help = "The maximum number of outputters", default = "2", short = "n")]
+    outputter_capacity: usize,
 }
 
 /// The current state of all sources.
@@ -77,6 +97,8 @@ pub struct State {
     outputter_capacity: usize,
     /// The total number of channels we output.
     output_channel_count: usize,
+    /// The number of channels per indivisible group for the purposes of dividing between outputters (3 for RGB)
+    channel_group_size: usize,
     /// The current number of channels we take from each source. This is at most `output_channel_count / outputters.len()`. However, it may be less
     /// due to maintaining a multiple of 3 channels per outputter.
     input_channel_count: usize,
@@ -87,24 +109,26 @@ pub struct State {
     /// The current frame counter.
     frame: usize,
     /// The time (in seconds) it took to run the last frame on the main thread. If this reaches 1/FPS, lock contention between the main thread and the input thread will occur.
+    #[serde(skip)]
     frame_time: f64,
 }
 impl State {
     /// Creates a new `State` with the given configuration.
-    pub fn new(
-        outputter_capacity: usize,
-        output_channel_count: usize,
-        timeout: usize,
-        output_time: usize,
-    ) -> Self {
+    fn new(opts: &Args) -> Self {
+        let timeout = (opts.timeout * opts.fps).ceil() as usize;
+        let output_time = (opts.output_time * opts.fps).ceil() as usize;
+        assert!(opts.fps > 0.0, "FPS must be greater than 0");
+        assert!(timeout > 0, "Timeout must be greater than 0");
+        assert!(output_time > 0, "Output time must be greater than 0");
         Self {
             sources: HashMap::new(),
             queue: VecDeque::new(),
             outputters: Vec::new(),
-            outputter_capacity,
-            output_channel_count,
-            // We start with 0 input channels, as we have no outputters yet.
-            input_channel_count: 0,
+            outputter_capacity: opts.outputter_capacity,
+            output_channel_count: opts.output_channels,
+            channel_group_size: opts.group_size,
+            // We start with no outputters, so just cap to output channel count as placeholder
+            input_channel_count: opts.output_channels,
             timeout,
             output_time,
             frame: 0,

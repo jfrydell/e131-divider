@@ -87,7 +87,28 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
         }
         outputter_count_changed = true;
     } else {
-        // The queue isn't empty, so we must remove outputters that have reached the maximum output time
+        // The queue isn't empty after removing timed out outputters. We have two other things to try and do:
+        // 1. We can expand the number of outputters
+        // 2. We can remove outputters that have reached the maximum output time
+
+        // If possible, expand outputters count
+        if state.outputters.len() < state.outputter_capacity {
+            let to_expand = state.outputter_capacity - state.outputters.len();
+            for source in state.queue.drain(..to_expand.min(state.queue.len())) {
+                state.sources.insert(
+                    source.common.addr,
+                    SourcePosition::Outputting(state.outputters.len()),
+                );
+                // We manually construct OutputtingSource to avoid borrowing state; also we don't need to create data since we know it will be overwritten b/c input channel count change
+                state.outputters.push(OutputtingSource {
+                    common: source.common,
+                    start_frame: state.frame,
+                    data: vec![], // Will be overwritten
+                });
+            }
+            outputter_count_changed = true;
+        }
+        // For any remaining in the queue, we must remove outputters that have reached the maximum output time
         for i in done_outputters.drain(..state.queue.len().min(done_outputters.len())) {
             // Get the replacement source from the queue and update the lookup table
             let new_source = state.queue.pop_front().unwrap();
@@ -109,25 +130,6 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
                 SourcePosition::Queue(state.queue.len()),
             );
             state.queue.push_back(QueuedSource::from(old_source));
-        }
-        // If there are sources queued, we can try and expand the number of outputters to accommodate them
-        if !state.queue.is_empty() && state.outputters.len() < state.outputter_capacity {
-            for source in state
-                .queue
-                .drain(..state.outputter_capacity.min(state.queue.len()))
-            {
-                state.sources.insert(
-                    source.common.addr,
-                    SourcePosition::Outputting(state.outputters.len()),
-                );
-                // We manually construct OutputtingSource to avoid borrowing state; also we don't need to create data since we know it will be overwritten b/c input channel count change
-                state.outputters.push(OutputtingSource {
-                    common: source.common,
-                    start_frame: state.frame,
-                    data: vec![], // Will be overwritten
-                });
-            }
-            outputter_count_changed = true;
         }
     }
 

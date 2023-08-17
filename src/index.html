@@ -7,7 +7,7 @@
 </head>
 <body>
   <h1>DividE1.31</h1>
-  <p>This is the status page for DividE1.31, the first (AFAIK) E1.31 controller to allow several senders (such as lighting sequencers) to share one receiving element.</p>
+  <p>This is the status page for DividE1.31, the (AFAIK) first E1.31 controller to allow several senders (such as lighting sequencers) to fairly share one receiving element.</p>
   <h2>Frequently Asked Questions</h2>
   <ul>
     <li>
@@ -23,6 +23,10 @@
         <li>Send data to the output</li>
         <li>If you are inactive for the timeout listed below (either by not sending data or sending all 0s), you will be automatically disconnected.</li>
       </ol>
+    </li>
+    <li>
+      <h3>What if I don't want to expose my IP address to random strangers via this page?</h3>
+      <p>Well you (probably) already sent it to me when your browser loaded this page. If, for some reason, you're worried about this page's (soon to be millions of) users but not me, then feel free to <a href="https://security.stackexchange.com/questions/155007/is-it-possible-to-successfully-send-a-spoofed-udp-header-with-a-completely-unrel">spoof your IP</a> (good luck).</p>
     </li>
     <li>
       <h3>Does this support _____?</h3>
@@ -83,7 +87,7 @@
     currentlyQueued.innerHTML = '';
     data.outputters.forEach(source => {
       const li = document.createElement('li');
-      li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Outputting for ${data.frame - source.start_frame} frames - Last packet ${data.frame - source.common.last_packet} frames ago`;
+      li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Outputting for ${data.frame - source.start_frame} frames - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
 
       // Add output preview
       const outputPreview = document.createElement('div');
@@ -105,7 +109,7 @@
     });
     data.queue.forEach(source => {
       const li = document.createElement('li');
-      li.innerText = `<strong>${source.common.addr}</strong> - ${source.common.name} - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
+      li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
       currentlyQueued.appendChild(li);
     });
     setTimeout(update, 500);

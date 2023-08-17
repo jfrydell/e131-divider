@@ -21,7 +21,7 @@ async fn main() {
     let fps = 20;
     // Initialize the state. Uses `Mutex` because both input thread and main thread need write access
     // (initially had interior mutability for different sources, but input thread can't actually process packets concurrently (each packet is processsed ~instantly with no awaiting))
-    let state = Arc::new(Mutex::new(State::new(5, 100, 2 * fps, 10 * fps)));
+    let state = Arc::new(Mutex::new(State::new(2, 100, 2 * fps, 20 * fps)));
     // Start the webserver
     tokio::spawn(website::main(Arc::clone(&state)));
     // Listen for incoming E1.31 packets

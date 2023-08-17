@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
-use tokio::{net::UdpSocket, sync::RwLock};
+use serde::Serialize;
+use tokio::{net::UdpSocket, sync::Mutex};
 use tracing::debug;
 
 mod input;
@@ -18,11 +19,11 @@ async fn main() {
     tracing_subscriber::fmt::init();
     // Set fps
     let fps = 20;
-    // Initialize the state
-    let state = Arc::new(RwLock::new(State::new(5, 100, 2 * fps, 10 * fps)));
-    let site_state = Arc::new(RwLock::new(website::SiteState::new()));
+    // Initialize the state. Uses `Mutex` because both input thread and main thread need write access
+    // (initially had interior mutability for different sources, but input thread can't actually process packets concurrently (each packet is processsed ~instantly with no awaiting))
+    let state = Arc::new(Mutex::new(State::new(5, 100, 2 * fps, 10 * fps)));
     // Start the webserver
-    tokio::spawn(website::main(Arc::clone(&site_state)));
+    tokio::spawn(website::main(Arc::clone(&state)));
     // Listen for incoming E1.31 packets
     let e131_socket = UdpSocket::bind("0.0.0.0:5568").await.unwrap();
     tokio::spawn(input::handle_incoming(state.clone(), e131_socket));
@@ -34,25 +35,28 @@ async fn main() {
     let fps = fps as f64;
     let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / fps));
     loop {
-        debug!("Frame {}", state.read().await.frame);
+        // Lock the state to start the frame (stops input thread)
+        let mut state = state.lock().await;
         let frame_start = Instant::now();
+        debug!("Frame {}", state.frame);
 
-        // Acquire state lock to run frame and generate new site state
-        let mut state = state.write().await;
+        // Run the frame and measure total time
         output::run_frame(&mut state, &output_socket).await;
-        let new_site_state = website::SiteState::update(&mut state);
+        let frame_time = frame_start.elapsed();
+        state.frame_time = frame_time.as_secs_f64();
+
+        // Validate state (consists of `debug_assert`s)
+        state.validate();
+
+        // Drop the lock to allow input thread to continue. This marks the end of the main thread's actual processing
         drop(state);
 
-        // Measure frame time
-        let frame_time = frame_start.elapsed();
+        // Logging
         debug!(
             "Frame utilization: {}\t({}% utilization)",
             frame_time.as_secs_f64(),
             frame_time.as_secs_f64() * fps * 100.0
         );
-
-        // Update site state (done outside state lock to avoid unnecessary block for processing input)
-        *site_state.write().await = new_site_state;
 
         // Wait for next frame
         clock.tick().await;
@@ -60,19 +64,15 @@ async fn main() {
 }
 
 /// The current state of all sources.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Clone)]
 pub struct State {
-    /// A map from IP address to source state. The source state is wrapped in a `Mutex` so that
-    /// everyone can share access to the `State` while processing packets.
-    sources: HashMap<SocketAddr, Mutex<SourceState>>,
+    /// A map from IP address to source positions (either `Queue` or `Outputting`). Used for quick lookup on incoming packets.
+    #[serde(skip)]
+    sources: HashMap<SocketAddr, SourcePosition>,
     /// A queue of sources that are waiting to output.
-    queue: VecDeque<SocketAddr>,
+    queue: VecDeque<QueuedSource>,
     /// A list of sources that are currently outputting, which preserves order (corresponds to positions in actual output).
-    outputters: Vec<SocketAddr>,
-    /// A list of new sources that have been added since the last frame. Unlike the `sources` map,
-    /// this whole thing is wrapped in a `Mutex` to allow for new sources to be added with shared
-    /// access to state.
-    new_sources: Mutex<Vec<(SocketAddr, SourceState)>>,
+    outputters: Vec<OutputtingSource>,
     /// The maximum number of outputters we allow.
     outputter_capacity: usize,
     /// The total number of channels we output.
@@ -86,6 +86,8 @@ pub struct State {
     output_time: usize,
     /// The current frame counter.
     frame: usize,
+    /// The time (in seconds) it took to run the last frame on the main thread. If this reaches 1/FPS, lock contention between the main thread and the input thread will occur.
+    frame_time: f64,
 }
 impl State {
     /// Creates a new `State` with the given configuration.
@@ -99,7 +101,6 @@ impl State {
             sources: HashMap::new(),
             queue: VecDeque::new(),
             outputters: Vec::new(),
-            new_sources: Mutex::new(Vec::new()),
             outputter_capacity,
             output_channel_count,
             // We start with 0 input channels, as we have no outputters yet.
@@ -107,36 +108,106 @@ impl State {
             timeout,
             output_time,
             frame: 0,
+            frame_time: 0.0,
         }
     }
-    /// Convenience function for getting a `SourceState` by `SocketAddr` with mutable access, which doesn't require locking.
-    /// Panics if the source doesn't exist.
-    ///
-    /// (Because it takes `&mut self`, this can't be used while borrowing an unrelated field, unfortunately.)
-    fn source(&mut self, addr: &SocketAddr) -> &mut SourceState {
-        self.sources.get_mut(addr).unwrap().get_mut().unwrap()
+    /// Validates that state invariants are upheld, panicking if not.
+    fn validate(&self) {
+        debug_assert!(
+            self.outputters.len() <= self.outputter_capacity,
+            "Outputters: {}, Capacity: {}",
+            self.outputters.len(),
+            self.outputter_capacity
+        );
+        debug_assert!(
+            self.input_channel_count * self.outputters.len() <= self.output_channel_count,
+            "Input channel count: {}, Output channel count: {}, Outputters: {}",
+            self.input_channel_count,
+            self.output_channel_count,
+            self.outputters.len()
+        );
+        debug_assert!(
+            self.queue.len() + self.outputters.len() == self.sources.len(),
+            "Queue: {}, Outputters: {}, Sources: {}",
+            self.queue.len(),
+            self.outputters.len(),
+            self.sources.len()
+        );
+        // Validate sources HashMap
+        for (&addr, position) in &self.sources {
+            match position {
+                SourcePosition::Queue(i) => {
+                    debug_assert!(self.queue[*i].common.addr == addr)
+                }
+                SourcePosition::Outputting(i) => {
+                    debug_assert!(self.outputters[*i].common.addr == addr)
+                }
+            }
+        }
     }
 }
 
-/// The current state of any given source.
-#[derive(Debug, Clone)]
-pub struct SourceState {
+/// A source that is queued to output.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueuedSource {
+    /// The source's common info.
+    common: SourceCommon,
+}
+impl QueuedSource {
+    /// Creates a new `QueuedSource` given the source's name and IP address, along with the current state (for frame).
+    pub fn new(name: String, addr: SocketAddr, current_state: &State) -> Self {
+        Self {
+            common: SourceCommon {
+                name,
+                addr,
+                last_packet: current_state.frame,
+            },
+        }
+    }
+    /// Creates a new `QueuedSource` from the given `OutputtingSource` that is moving back to the queue.
+    pub fn from(outputting: OutputtingSource) -> Self {
+        Self {
+            common: outputting.common,
+        }
+    }
+}
+
+/// A source that is currently outputting.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputtingSource {
+    /// The source's common info.
+    common: SourceCommon,
+    /// The frame at which the source started outputting.
+    start_frame: usize,
+    /// The current output data. Guarenteed to be equal in length to `input_channel_count`.
+    data: Vec<u8>,
+}
+impl OutputtingSource {
+    /// Creates a new `OutputtingSource` from the given `QueuedSource` that is moving to outputting.
+    /// The new source has it's outputting start frame set to the current frame and it's data set to 0's for all `input_channel_count` channels.
+    pub fn from(queued: QueuedSource, current_state: &State) -> Self {
+        Self {
+            common: queued.common,
+            start_frame: current_state.frame,
+            data: vec![0; current_state.input_channel_count],
+        }
+    }
+}
+
+/// The info we keep track of for all sources.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCommon {
+    /// The source's IP address.
+    addr: SocketAddr,
     /// The source's name, as sent in packets.
     name: String,
     /// The frame at which the last packet was received.
     last_packet: usize,
-    /// The position of the source (either in queue or outputting).
-    position: SourcePosition,
 }
 
 /// The position of a source, either in the queue or outputting.
 #[derive(Debug, Clone)]
 pub enum SourcePosition {
-    Queue,
-    Outputting {
-        /// The frame at which the source started outputting.
-        start_frame: usize,
-        /// The current data being output. The length of this is guaranteed to be equal to `input_channel_count`.
-        current_data: Vec<u8>,
-    },
+    Queue(usize),
+    Outputting(usize),
 }

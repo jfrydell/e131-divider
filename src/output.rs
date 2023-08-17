@@ -1,9 +1,7 @@
-use std::{net::SocketAddr, sync::Mutex};
-
 use tokio::net::UdpSocket;
 use tracing::trace;
 
-use crate::{SourcePosition, State};
+use crate::{OutputtingSource, QueuedSource, SourcePosition, State};
 
 /// Performs one frame of the main loop.
 ///
@@ -14,41 +12,22 @@ use crate::{SourcePosition, State};
 pub async fn run_frame(state: &mut State, output: &UdpSocket) {
     // Assemble the data for this frame (done before queue update because data isn't stored for queued controllers)
     let mut data = [0u8; 512];
-    for (i, outputter) in state.outputters.iter().enumerate() {
-        let source = state.sources.get_mut(outputter).unwrap().get_mut().unwrap();
-        let source_data = match &source.position {
-            SourcePosition::Outputting { current_data, .. } => current_data,
-            SourcePosition::Queue => unreachable!(),
-        };
+    for (i, source) in state.outputters.iter().enumerate() {
         data[i * state.input_channel_count..(i + 1) * state.input_channel_count]
-            .copy_from_slice(&source_data);
+            .copy_from_slice(&source.data);
     }
     // Output the data
     send_e131(&output, &data, 1, state.frame as u8)
         .await
         .unwrap();
 
-    // Add any new sources to the queue. If a source is already in the `sources` map, it must be a duplicate (as it would have been added on a previous iteration), so it is ignored.
-    for (addr, source_state) in state.new_sources.get_mut().unwrap().drain(..) {
-        // Add the source to the `HashMap`, and to the queue if it isn't a duplicate
-        if !state
-            .sources
-            .insert(addr, Mutex::new(source_state))
-            .is_some()
-        {
-            state.queue.push_back(addr);
-        }
-    }
-    trace!("Added new sources. Queue size: {}", state.queue.len());
-
-    // Remove any sources that have disconnected (last packet was more than `state.timeout` ago)
+    // Remove any sources from the queue that have disconnected (last packet was more than `state.timeout` ago). Can't use `retain` because we need to remove from `state.sources` as well.
     let mut i = 0;
     while i < state.queue.len() {
-        let addr = state.queue[i];
-        let source = state.source(&addr);
+        let source = &state.queue[i].common;
         if source.last_packet + state.timeout < state.frame {
+            state.sources.remove(&source.addr);
             state.queue.remove(i);
-            state.sources.remove(&addr);
         } else {
             i += 1;
         }
@@ -64,81 +43,87 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
     // to the number of outputters must be followed by an update to the `input_channel_count`, as well as updating all output data.
     // Flag for number of outputters changing:
     let mut outputter_count_changed = false;
-    #[derive(PartialEq, PartialOrd, Eq, Ord)]
-    struct Outputter {
-        addr: SocketAddr,
-        position: usize,
-    }
-    // Find any outputters that must be removed due to disconnection
+    // Find indices of any outputters that must be removed due to disconnection
     let mut timed_out_outputters = vec![];
-    for (position, &addr) in state.outputters.iter().enumerate() {
-        let source = state.sources.get_mut(&addr).unwrap().get_mut().unwrap();
-        if source.last_packet + state.timeout < state.frame {
-            timed_out_outputters.push(Outputter { addr, position });
+    for (i, source) in state.outputters.iter().enumerate() {
+        if source.common.last_packet + state.timeout < state.frame {
+            timed_out_outputters.push(i);
         }
     }
 
-    // Find any outputters that have reached the maximum output time
+    // Find indices of any outputters that have reached the maximum output time
     let mut done_outputters = vec![];
-    for (position, &addr) in state.outputters.iter().enumerate() {
-        let source_state = &state.sources.get_mut(&addr).unwrap().get_mut().unwrap();
-        let start_frame = match source_state.position {
-            SourcePosition::Outputting { start_frame, .. } => start_frame,
-            SourcePosition::Queue => unreachable!(),
-        };
-        if start_frame + state.output_time <= state.frame {
-            done_outputters.push(Outputter { addr, position });
+    for (i, source) in state.outputters.iter().enumerate() {
+        if source.start_frame + state.output_time <= state.frame {
+            done_outputters.push(i);
         }
     }
 
     // Remove timed out outputters that can be replaced with queued sources
     for i in timed_out_outputters.drain(..state.queue.len().min(timed_out_outputters.len())) {
-        let new_addr = state.queue.pop_front().unwrap();
-        state.outputters[i.position] = new_addr;
-        state.source(&new_addr).position = SourcePosition::Outputting {
-            start_frame: state.frame,
-            current_data: vec![0; state.input_channel_count],
-        };
-        state.sources.remove(&i.addr);
+        // Remove the timed out outputter from the lookup table
+        state.sources.remove(&state.outputters[i].common.addr);
+        // Replace the timed out outputter with the queued source, updating its position in the lookup table
+        let new_source = state.queue.pop_front().unwrap();
+        state
+            .sources
+            .insert(new_source.common.addr, SourcePosition::Outputting(i));
+        state.outputters[i] = OutputtingSource::from(new_source, state);
     }
     if timed_out_outputters.len() > 0 {
-        // The queue is empty, but there are still timed out outputters. Remove them in inverse order (so the indices don't change)
-        timed_out_outputters.sort_by_key(|i| i.position);
+        // The queue is empty, but there are still timed out outputters. Remove them in inverse order (so timed out indices don't change)
+        timed_out_outputters.sort();
         for i in timed_out_outputters.into_iter().rev() {
-            state.outputters.remove(i.position);
-            state.sources.remove(&i.addr);
+            state.sources.remove(&state.outputters[i].common.addr);
+            state.outputters.remove(i);
+        }
+        // Recreate lookup table to account for index changes
+        for (i, source) in state.outputters.iter().enumerate() {
+            state
+                .sources
+                .insert(source.common.addr, SourcePosition::Outputting(i));
         }
         outputter_count_changed = true;
     } else {
         // The queue isn't empty, so we must remove outputters that have reached the maximum output time
         for i in done_outputters.drain(..state.queue.len().min(done_outputters.len())) {
-            let new_addr = state.queue.pop_front().unwrap();
-            state.outputters[i.position] = new_addr;
-            state.source(&new_addr).position = SourcePosition::Outputting {
-                start_frame: state.frame,
-                current_data: vec![0; state.input_channel_count],
-            };
-            state.queue.push_back(i.addr);
-            state.source(&i.addr).position = SourcePosition::Queue;
+            // Get the replacement source from the queue and update the lookup table
+            let new_source = state.queue.pop_front().unwrap();
+            state
+                .sources
+                .insert(new_source.common.addr, SourcePosition::Outputting(i));
+            // Swap out the old source for the new one (between table lookups to avoid borrowing issues on addr (could refactor and store addr on stack for more logical order))
+            let old_source = std::mem::replace(
+                &mut state.outputters[i],
+                OutputtingSource {
+                    common: new_source.common,
+                    start_frame: state.frame,
+                    data: vec![0; state.input_channel_count],
+                },
+            );
+            // Update lookup table and add old source to queue
+            state.sources.insert(
+                old_source.common.addr,
+                SourcePosition::Queue(state.queue.len()),
+            );
+            state.queue.push_back(QueuedSource::from(old_source));
         }
         // If there are sources queued, we can try and expand the number of outputters to accommodate them
         if !state.queue.is_empty() && state.outputters.len() < state.outputter_capacity {
-            for addr in state
+            for source in state
                 .queue
                 .drain(..state.outputter_capacity.min(state.queue.len()))
             {
-                state.outputters.push(addr);
-                state
-                    .sources
-                    .get_mut(&addr)
-                    .unwrap()
-                    .get_mut()
-                    .unwrap()
-                    .position = SourcePosition::Outputting {
+                state.sources.insert(
+                    source.common.addr,
+                    SourcePosition::Outputting(state.outputters.len()),
+                );
+                // We manually construct OutputtingSource to avoid borrowing state; also we don't need to create data since we know it will be overwritten b/c input channel count change
+                state.outputters.push(OutputtingSource {
+                    common: source.common,
                     start_frame: state.frame,
-                    // We don't need to initialize `current_data` here, as it will be overwritten due to the change in outputter count affecting `input_channel_count`.
-                    current_data: vec![],
-                };
+                    data: vec![], // Will be overwritten
+                });
             }
             outputter_count_changed = true;
         }
@@ -148,30 +133,14 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
     if outputter_count_changed {
         state.input_channel_count =
             calculate_input_channel_count(state.output_channel_count, state.outputters.len());
-        for addr in &state.outputters {
-            match state
-                .sources
-                .get_mut(&addr)
-                .unwrap()
-                .get_mut()
-                .unwrap()
-                .position
-            {
-                SourcePosition::Outputting {
-                    ref mut current_data,
-                    ..
-                } => {
-                    current_data.resize(state.input_channel_count, 0);
-                }
-                SourcePosition::Queue => unreachable!(),
-            }
+        for source in state.outputters.iter_mut() {
+            source.data.resize(state.input_channel_count, 0);
         }
     }
 
     trace!("Outputting Sources:");
-    for addr in state.outputters.iter() {
-        let source = state.sources.get_mut(&addr).unwrap().get_mut().unwrap();
-        trace!("\t{addr} ({}): {:?}", source.name, source.position)
+    for source in state.outputters.iter() {
+        trace!("\t{} ({})", source.common.addr, source.common.name,)
     }
 
     // Increment frame counter

@@ -1,29 +1,23 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use tokio::{net::UdpSocket, sync::RwLock};
+use tokio::{net::UdpSocket, sync::Mutex};
 use tracing::trace;
 
-use crate::{SourcePosition, SourceState, State};
+use crate::{QueuedSource, SourcePosition, State};
 
 /// Handles all incoming packets.
-pub async fn handle_incoming(state: Arc<RwLock<State>>, socket: UdpSocket) {
+pub async fn handle_incoming(state: Arc<Mutex<State>>, socket: UdpSocket) {
     loop {
         // Receive a packet from the socket
         let mut buf = Vec::with_capacity(639); // Max packet size is 638, and this is checked in `validate`, so clamping larger packets is fine (they will fail validation for either incorrect universe_size or universe_size > 512)
         let (_, source) = socket.recv_buf_from(&mut buf).await.unwrap();
-        // Acquire a read lock on the state. Ideally, we'd pass this `&State` to `handle_input`, but we can't without using unsafe to make the guard live long enough (passing in the `Arc` as well to ensure it does). We still acquire the lock here, though, so we stop receiving packets (and spawning tasks) while we're running a frame.
-        let _ = state.read().await;
-        // Handle the packet in a separate task so we can continue receiving packets, processing them concurrently due to shared references (via `RwLock`)
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let state = state.read().await;
-            handle_input(&state, &source, buf).await
-        });
+        // Handle the input, locking the current state to handle the input. This should only block when the main loop is doing something.
+        handle_input(&mut *state.lock().await, &source, buf);
     }
 }
 
 /// Handles one input from a source.
-async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
+fn handle_input(state: &mut State, addr: &SocketAddr, data: Vec<u8>) {
     // Get packet data
     let Some((name, _, data)) = validate(&data) else {return;};
     // Discard if data is all zeros
@@ -33,31 +27,24 @@ async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
     trace!("Received packet from {addr} ({name})");
     // Lookup source
     match state.sources.get(addr) {
-        Some(source_state) => {
-            // The source exists, so update its data (last packet time and current output data if applicable)
-            let mut source_state = source_state.lock().unwrap();
-            source_state.last_packet = state.frame;
-            match source_state.position {
-                SourcePosition::Outputting {
-                    ref mut current_data,
-                    ..
-                } => {
-                    let to_copy = data.len().min(current_data.len());
-                    current_data[..to_copy].copy_from_slice(&data[..to_copy]);
-                }
-                SourcePosition::Queue => {}
-            }
+        Some(SourcePosition::Outputting(i)) => {
+            let source_state = &mut state.outputters[*i];
+            source_state.common.last_packet = state.frame;
+            let to_copy = data.len().min(source_state.data.len());
+            source_state.data[..to_copy].copy_from_slice(&data[..to_copy]);
+        }
+        Some(SourcePosition::Queue(i)) => {
+            let source_state = &mut state.queue[*i];
+            source_state.common.last_packet = state.frame;
         }
         None => {
-            // The source doesn't exist, so add it to the list of newly connected sources
-            state.new_sources.lock().unwrap().push((
-                *addr,
-                SourceState {
-                    name: name.to_string(),
-                    last_packet: state.frame,
-                    position: SourcePosition::Queue,
-                },
-            ));
+            // The source doesn't exist, so add it to the queue (and lookup table)
+            state
+                .sources
+                .insert(*addr, SourcePosition::Queue(state.queue.len()));
+            state
+                .queue
+                .push_back(QueuedSource::new(name.to_string(), *addr, state));
         }
     }
 }

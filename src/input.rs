@@ -26,6 +26,10 @@ pub async fn handle_incoming(state: Arc<RwLock<State>>, socket: UdpSocket) {
 async fn handle_input(state: &State, addr: &SocketAddr, data: Vec<u8>) {
     // Get packet data
     let Some((name, _, data)) = validate(&data) else {return;};
+    // Discard if data is all zeros
+    if data.iter().all(|&x| x == 0) {
+        return;
+    }
     trace!("Received packet from {addr} ({name})");
     // Lookup source
     match state.sources.get(addr) {

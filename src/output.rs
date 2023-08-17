@@ -1,32 +1,9 @@
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{net::SocketAddr, sync::Mutex};
 
-use tokio::{net::UdpSocket, sync::RwLock};
-use tracing::{debug, trace};
+use tokio::net::UdpSocket;
+use tracing::trace;
 
 use crate::{SourcePosition, State};
-
-/// Runs the main loop, outputting data each frame and sleeping between.
-pub async fn run(state: Arc<RwLock<State>>, output_socket: UdpSocket, fps: f64) {
-    let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / fps));
-    loop {
-        debug!("Frame {}", state.read().await.frame);
-        let frame_start = Instant::now();
-        let mut state = state.write().await;
-        run_frame(&mut state, &output_socket).await;
-        drop(state);
-        let frame_time = frame_start.elapsed();
-        debug!(
-            "Frame utilization: {}\t({}% utilization)",
-            frame_time.as_secs_f64(),
-            frame_time.as_secs_f64() * fps * 100.0
-        );
-        clock.tick().await;
-    }
-}
 
 /// Performs one frame of the main loop.
 ///

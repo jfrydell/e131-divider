@@ -2,12 +2,15 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use tokio::{net::UdpSocket, sync::RwLock};
+use tracing::debug;
 
 mod input;
 mod output;
+mod website;
 
 #[tokio::main]
 async fn main() {
@@ -16,16 +19,44 @@ async fn main() {
     // Set fps
     let fps = 20;
     // Initialize the state
-    let state = Arc::new(RwLock::new(State::new(5, 100, fps, 10 * fps)));
+    let state = Arc::new(RwLock::new(State::new(5, 100, 2 * fps, 10 * fps)));
+    let site_state = Arc::new(RwLock::new(website::SiteState::new()));
+    // Start the webserver
+    tokio::spawn(website::main(Arc::clone(&site_state)));
     // Listen for incoming E1.31 packets
     let e131_socket = UdpSocket::bind("0.0.0.0:5568").await.unwrap();
     tokio::spawn(input::handle_incoming(state.clone(), e131_socket));
-    // Run the main loop
+    // Setup output
     let output_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    output_socket.connect("127.0.0.1:558").await.unwrap();
-    tokio::spawn(output::run(Arc::clone(&state), output_socket, fps as f64))
-        .await
-        .unwrap();
+    output_socket.connect("192.168.168.200:5568").await.unwrap();
+
+    // Run the main loop
+    let fps = fps as f64;
+    let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / fps));
+    loop {
+        debug!("Frame {}", state.read().await.frame);
+        let frame_start = Instant::now();
+
+        // Acquire state lock to run frame and generate new site state
+        let mut state = state.write().await;
+        output::run_frame(&mut state, &output_socket).await;
+        let new_site_state = website::SiteState::update(&mut state);
+        drop(state);
+
+        // Measure frame time
+        let frame_time = frame_start.elapsed();
+        debug!(
+            "Frame utilization: {}\t({}% utilization)",
+            frame_time.as_secs_f64(),
+            frame_time.as_secs_f64() * fps * 100.0
+        );
+
+        // Update site state (done outside state lock to avoid unnecessary block for processing input)
+        *site_state.write().await = new_site_state;
+
+        // Wait for next frame
+        clock.tick().await;
+    }
 }
 
 /// The current state of all sources.

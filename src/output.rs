@@ -59,6 +59,8 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
         }
     }
 
+    // TODO: We should actually not do this if we have room to grow outputters instead. Maybe can just do all growth first?
+
     // Remove timed out outputters that can be replaced with queued sources
     for i in timed_out_outputters.drain(..state.queue.len().min(timed_out_outputters.len())) {
         // Remove the timed out outputter from the lookup table

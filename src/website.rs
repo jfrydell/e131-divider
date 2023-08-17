@@ -22,7 +22,7 @@ pub async fn main(state: Arc<Mutex<AppState>>) {
         .unwrap()
 }
 async fn status_page() -> impl IntoResponse {
-    Html("<html><head><title>Lighting Controller</title></head><body><h1>Lighting Controller</h1><p>Running</p></body></html>")
+    Html(include_str!("index.html"))
 }
 
 async fn get_state(State(state): State<Arc<Mutex<AppState>>>) -> Json<AppState> {

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DividE1.31</title>
+</head>
+<body>
+  <h1>DividE1.31</h1>
+  <p>This is the status page for DividE1.31, the first (AFAIK) E1.31 controller to allow several senders (such as lighting sequencers) to share one receiving element.</p>
+  <h2>Frequently Asked Questions</h2>
+  <ul>
+    <li>
+      <h3>Is this useful?</h3>
+      <p>No.</p>
+    </li>
+    <li>
+      <h3>How can I connect my sequencer?</h3>
+      <ol>
+        <li>Look at the URL bar</li>
+        <li>Use that as the IP for a standard E1.31 controller (port 5568, as usual)</li>
+        <li>Turn off any fancy settings (auto-config, auto-sizing, whatever new stuff xLights is adding)</li>
+        <li>Send data to the output</li>
+        <li>If you are inactive for the timeout listed below (either by not sending data or sending all 0s), you will be automatically disconnected.</li>
+      </ol>
+    </li>
+    <li>
+      <h3>Does this support _____?</h3>
+      <p>If _____ is one-universe E1.31 data packets, then yes. Otherwise (output to more than one universe, Universe Synchronization, Universe Discovery, Protection against XSS attacks via E1.31 packet names, etc.) no.</p>
+    </li>
+  </ul>
+  <h2>Current Status</h2>
+  <ul>
+    <li>
+      <strong>Frame:</strong> <span id="frame">0</span>
+    </li>
+    <li>
+      <strong>Framerate:</strong> however fast the above is changing
+    </li>
+    <li>
+      <strong>Total Output Channel Count:</strong> <span id="output_channel_count">0</span>
+    </li>
+    <li>
+      <strong>Current Input Channel Count Per Source:</strong> <span id="input_channel_count">0</span>
+    </li>
+    <li>
+      <strong>Max Concurrently Outputting Sources:</strong> <span id="outputter_capacity">0</span>
+    </li>
+    <li>
+      <strong>Minimum Output Time:</strong> <span id="output_time">0</span> frames
+    </li>
+    <li>
+      <strong>Inactivity Timeout:</strong> <span id="timeout">0</span> frames
+    </li>
+  </ul>
+  <h3>Currently Outputting Sources</h3>
+  <ul id="currently-outputting">
+    <li>None</li>
+  </ul>
+  <h3>Currently Queued Sources</h3>
+  <ol id="currently-queued">
+    <li>None</li>
+  </ol>
+</body>
+
+<script>
+  async function update() {
+    // Get state
+    const response = await fetch('/state');
+    const data = await response.json();
+
+    // Basic data update
+    const basic_stuff = ["frame", "outputter_capacity", "output_time", "output_channel_count", "input_channel_count", "timeout"];
+    for (const key of basic_stuff) {
+      const element = document.getElementById(key);
+      element.innerText = data[key];
+    }
+
+    // Source lists
+    const currentlyOutputting = document.getElementById('currently-outputting');
+    const currentlyQueued = document.getElementById('currently-queued');
+    currentlyOutputting.innerHTML = '';
+    currentlyQueued.innerHTML = '';
+    data.outputters.forEach(source => {
+      const li = document.createElement('li');
+      li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Outputting for ${data.frame - source.start_frame} frames - Last packet ${data.frame - source.common.last_packet} frames ago`;
+
+      // Add output preview
+      const outputPreview = document.createElement('div');
+      outputPreview.style.display = 'flex';
+      outputPreview.style.flexWrap = 'wrap';
+      for (let i = 0; i + 3 <= source.data.length; i += 3) {
+        const color = source.data.slice(i, i + 3);
+        const colorString = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+        const colorBlock = document.createElement('div');
+        colorBlock.style.width = '20px';
+        colorBlock.style.height = '20px';
+        colorBlock.style.backgroundColor = colorString;
+        colorBlock.style.border = '1px solid black';
+        outputPreview.appendChild(colorBlock);
+      }
+    
+      li.appendChild(outputPreview);
+      currentlyOutputting.appendChild(li);
+    });
+    data.queue.forEach(source => {
+      const li = document.createElement('li');
+      li.innerText = `<strong>${source.common.addr}</strong> - ${source.common.name} - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
+      currentlyQueued.appendChild(li);
+    });
+    setTimeout(update, 500);
+  }
+  document.addEventListener('DOMContentLoaded', () => {
+    update();
+  });
+</script>
+</html>

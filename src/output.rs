@@ -56,16 +56,6 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
         }
     }
 
-    // Find indices of any outputters that have reached the maximum output time
-    let mut done_outputters = vec![];
-    for (i, source) in state.outputters.iter().enumerate() {
-        if source.start_frame + state.output_time <= state.frame {
-            done_outputters.push(i);
-        }
-    }
-
-    // TODO: We should actually not do this if we have room to grow outputters instead. Maybe can just do all growth first?
-
     // Remove timed out outputters that can be replaced with queued sources
     for i in timed_out_outputters.drain(..state.queue.len().min(timed_out_outputters.len())) {
         // Remove the timed out outputter from the lookup table
@@ -77,26 +67,27 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
             .insert(new_source.common.addr, SourcePosition::Outputting(i));
         state.outputters[i] = OutputtingSource::from(new_source, state);
     }
+    // Now, either the queue or the list of timed out outputters is empty. If the queue is empty, we must remove all timed out outputters. Otherwise, we must attempt to add queued sources to outputters, possibly replacing finished outputters.
     if timed_out_outputters.len() > 0 {
-        // The queue is empty, but there are still timed out outputters. Remove them in inverse order (so timed out indices don't change)
+        // The queue is empty, but there are still timed out outputters. Remove them in inverse order (so indices in timed_out_outputters don't change)
         timed_out_outputters.sort();
         for i in timed_out_outputters.into_iter().rev() {
             state.sources.remove(&state.outputters[i].common.addr);
             state.outputters.remove(i);
         }
-        // Recreate lookup table to account for index changes
+        // Recreate lookup table to account for index changes to remaining outputters
         for (i, source) in state.outputters.iter().enumerate() {
             state
                 .sources
                 .insert(source.common.addr, SourcePosition::Outputting(i));
         }
         outputter_count_changed = true;
-    } else {
-        // The queue isn't empty after removing timed out outputters. We have two other things to try and do:
+    } else if state.queue.len() > 0 {
+        // The queue isn't empty after replacing all timed out outputters. We have two other things to try and do:
         // 1. We can expand the number of outputters
         // 2. We can remove outputters that have reached the maximum output time
 
-        // If possible, expand outputters count
+        // If possible, expand outputters count, noting that we did so with `outputter_count_changed` flag
         if state.outputters.len() < state.outputter_capacity {
             let to_expand = state.outputter_capacity - state.outputters.len();
             for source in state.queue.drain(..to_expand.min(state.queue.len())) {
@@ -113,8 +104,17 @@ pub async fn run_frame(state: &mut State, output: &UdpSocket) {
             }
             outputter_count_changed = true;
         }
-        // For any remaining in the queue, we must remove outputters that have reached the maximum output time
-        for i in done_outputters.drain(..state.queue.len().min(done_outputters.len())) {
+        // For any remaining in the queue, we must remove outputters that have reached the maximum output time. We do this from oldest to newest
+        // Find indices of any outputters that have reached the maximum output time, along with what frame they started (to replace oldest first)
+        let mut done_outputters = vec![];
+        for (i, source) in state.outputters.iter().enumerate() {
+            if source.start_frame + state.output_time <= state.frame {
+                done_outputters.push((i, source.start_frame));
+            }
+        }
+        done_outputters.sort_by_key(|&(_, start_frame)| start_frame);
+        // Replace oldest outputters with queued sources
+        for (i, _) in done_outputters.drain(..state.queue.len().min(done_outputters.len())) {
             // Get the replacement source from the queue and update the lookup table
             let new_source = state.queue.pop_front().unwrap();
             state

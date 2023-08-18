@@ -99,7 +99,7 @@ struct Args {
 pub struct State {
     /// A map from IP address to source positions (either `Queue` or `Outputting`). Used for quick lookup on incoming packets. The port is set to 0 for equality checks.
     #[serde(skip)]
-    sources: HashMap<SocketAddr, SourcePosition>,
+    sources: HashMap<SourceId, SourcePosition>,
     /// A queue of sources that are waiting to output.
     queue: VecDeque<QueuedSource>,
     /// A list of sources that are currently outputting, which preserves order (corresponds to positions in actual output).
@@ -169,17 +169,13 @@ impl State {
             self.sources.len()
         );
         // Validate sources HashMap
-        for (&addr, position) in &self.sources {
-            debug!(
-                "Validating source at addr {:?} with position {:?}",
-                addr, position
-            );
+        for (id, position) in &self.sources {
             match position {
                 SourcePosition::Queue(i) => {
-                    debug_assert!(self.queue[*i].common.addr == addr)
+                    debug_assert!(&self.queue[*i].id == id)
                 }
                 SourcePosition::Outputting(i) => {
-                    debug_assert!(self.outputters[*i].common.addr == addr)
+                    debug_assert!(&self.outputters[*i].id == id)
                 }
             }
         }
@@ -189,24 +185,24 @@ impl State {
 /// A source that is queued to output.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueuedSource {
-    /// The source's common info.
-    common: SourceCommon,
+    /// The source's identifier.
+    id: SourceId,
+    /// The frame at which the last packet was received.
+    last_packet: usize,
 }
 impl QueuedSource {
     /// Creates a new `QueuedSource` given the source's name and IP address, along with the current state (for frame).
-    pub fn new(name: String, addr: SocketAddr, current_state: &State) -> Self {
+    pub fn new(id: SourceId, current_state: &State) -> Self {
         Self {
-            common: SourceCommon {
-                name,
-                addr,
-                last_packet: current_state.frame,
-            },
+            id,
+            last_packet: current_state.frame,
         }
     }
     /// Creates a new `QueuedSource` from the given `OutputtingSource` that is moving back to the queue.
     pub fn from(outputting: OutputtingSource) -> Self {
         Self {
-            common: outputting.common,
+            id: outputting.id,
+            last_packet: outputting.last_packet,
         }
     }
 }
@@ -214,8 +210,10 @@ impl QueuedSource {
 /// A source that is currently outputting.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputtingSource {
-    /// The source's common info.
-    common: SourceCommon,
+    /// The source's identifier.
+    id: SourceId,
+    /// The frame at which the last packet was received.
+    last_packet: usize,
     /// The frame at which the source started outputting.
     start_frame: usize,
     /// The current output data. Guarenteed to be equal in length to `input_channel_count`.
@@ -226,22 +224,27 @@ impl OutputtingSource {
     /// The new source has it's outputting start frame set to the current frame and it's data set to 0's for all `input_channel_count` channels.
     pub fn from(queued: QueuedSource, current_state: &State) -> Self {
         Self {
-            common: queued.common,
+            id: queued.id,
+            last_packet: queued.last_packet,
             start_frame: current_state.frame,
             data: vec![0; current_state.input_channel_count],
         }
     }
 }
 
-/// The info we keep track of for all sources.
-#[derive(Debug, Clone, Serialize)]
-pub struct SourceCommon {
+/// A source's identifier, consisting of it's IP address (without port) and name.
+#[derive(Debug, Clone, Serialize, Hash, PartialEq, Eq)]
+pub struct SourceId {
     /// The source's IP address, with port set to 0 for equality checks.
     addr: SocketAddr,
     /// The source's name, as sent in packets.
     name: String,
-    /// The frame at which the last packet was received.
-    last_packet: usize,
+}
+impl SourceId {
+    pub fn new(mut addr: SocketAddr, name: String) -> Self {
+        addr.set_port(0);
+        Self { addr, name }
+    }
 }
 
 /// The position of a source, either in the queue or outputting.

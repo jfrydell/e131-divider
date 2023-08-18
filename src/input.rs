@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 use tracing::trace;
 
-use crate::{QueuedSource, SourcePosition, State};
+use crate::{QueuedSource, SourceId, SourcePosition, State};
 
 /// Handles all incoming packets.
 pub async fn handle_incoming(state: Arc<Mutex<State>>, socket: UdpSocket) {
@@ -28,10 +28,11 @@ fn handle_input(state: &mut State, mut addr: SocketAddr, data: Vec<u8>) {
     }
     trace!("Received packet from {addr} ({name}), universe {universe}");
     // Lookup source
-    match state.sources.get(&addr) {
+    let id = SourceId::new(addr, name.to_string());
+    match state.sources.get(&id) {
         Some(SourcePosition::Outputting(i)) => {
             let source_state = &mut state.outputters[*i];
-            source_state.common.last_packet = state.frame;
+            source_state.last_packet = state.frame;
 
             // Get universe offset and amount of data to copy (min of source_state length (in universe) and data length)
             let offset = universe.saturating_sub(1) * 510;
@@ -43,16 +44,14 @@ fn handle_input(state: &mut State, mut addr: SocketAddr, data: Vec<u8>) {
         }
         Some(SourcePosition::Queue(i)) => {
             let source_state = &mut state.queue[*i];
-            source_state.common.last_packet = state.frame;
+            source_state.last_packet = state.frame;
         }
         None => {
             // The source doesn't exist, so add it to the queue (and lookup table)
             state
                 .sources
-                .insert(addr, SourcePosition::Queue(state.queue.len()));
-            state
-                .queue
-                .push_back(QueuedSource::new(name.to_string(), addr, state));
+                .insert(id.clone(), SourcePosition::Queue(state.queue.len()));
+            state.queue.push_back(QueuedSource::new(id, state));
         }
     }
 }

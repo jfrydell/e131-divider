@@ -95,7 +95,7 @@
     currentlyQueued.innerHTML = '';
     data.outputters.forEach(source => {
       const li = document.createElement('li');
-      li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Outputting for ${data.frame - source.start_frame} frames - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
+      li.innerHTML = `<strong>${source.id.addr}</strong> - ${source.id.name} - Outputting for ${data.frame - source.start_frame} frames - Last packet ${data.frame - source.last_packet} frame(s) ago`;
 
       // Add output preview
       const outputPreview = document.createElement('div');
@@ -117,7 +117,7 @@
     });
     data.queue.forEach(source => {
       const li = document.createElement('li');
-      li.innerHTML = `<strong>${source.common.addr}</strong> - ${source.common.name} - Last packet ${data.frame - source.common.last_packet} frame(s) ago`;
+      li.innerHTML = `<strong>${source.id.addr}</strong> - ${source.id.name} - Last packet ${data.frame - source.last_packet} frame(s) ago`;
       currentlyQueued.appendChild(li);
     });
     setTimeout(update, get_update_interval());

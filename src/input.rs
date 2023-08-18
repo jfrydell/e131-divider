@@ -12,26 +12,32 @@ pub async fn handle_incoming(state: Arc<Mutex<State>>, socket: UdpSocket) {
         let mut buf = Vec::with_capacity(639); // Max packet size is 638, and this is checked in `validate`, so clamping larger packets is fine (they will fail validation for either incorrect universe_size or universe_size > 512)
         let (_, source) = socket.recv_buf_from(&mut buf).await.unwrap();
         // Handle the input, locking the current state to handle the input. This should only block when the main loop is doing something.
-        handle_input(&mut *state.lock().await, &source, buf);
+        handle_input(&mut *state.lock().await, source, buf);
     }
 }
 
 /// Handles one input from a source.
-fn handle_input(state: &mut State, addr: &SocketAddr, data: Vec<u8>) {
+fn handle_input(state: &mut State, mut addr: SocketAddr, data: Vec<u8>) {
+    // Ignore port for equality checks
+    addr.set_port(0);
     // Get packet data
-    let Some((name, _, data)) = validate(&data) else {return;};
+    let Some((name, universe, data)) = validate(&data) else {return;};
     // Discard if data is all zeros
     if data.iter().all(|&x| x == 0) {
         return;
     }
-    trace!("Received packet from {addr} ({name})");
+    trace!("Received packet from {addr} ({name}), universe {universe}");
     // Lookup source
-    match state.sources.get(addr) {
+    match state.sources.get(&addr) {
         Some(SourcePosition::Outputting(i)) => {
             let source_state = &mut state.outputters[*i];
             source_state.common.last_packet = state.frame;
-            let to_copy = data.len().min(source_state.data.len());
-            source_state.data[..to_copy].copy_from_slice(&data[..to_copy]);
+
+            // Get universe offset and amount of data to copy (min of source_state length (in universe) and data length)
+            let offset = universe.saturating_sub(1) * 510;
+            let to_copy = (source_state.data.len().saturating_sub(offset)).min(data.len());
+            // Copy data, offsetting by universe in source_state's data
+            source_state.data[offset..][..to_copy].copy_from_slice(&data[..to_copy]);
         }
         Some(SourcePosition::Queue(i)) => {
             let source_state = &mut state.queue[*i];
@@ -41,10 +47,10 @@ fn handle_input(state: &mut State, addr: &SocketAddr, data: Vec<u8>) {
             // The source doesn't exist, so add it to the queue (and lookup table)
             state
                 .sources
-                .insert(*addr, SourcePosition::Queue(state.queue.len()));
+                .insert(addr, SourcePosition::Queue(state.queue.len()));
             state
                 .queue
-                .push_back(QueuedSource::new(name.to_string(), *addr, state));
+                .push_back(QueuedSource::new(name.to_string(), addr, state));
         }
     }
 }

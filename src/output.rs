@@ -11,15 +11,20 @@ use crate::{OutputtingSource, QueuedSource, SourcePosition, State};
 /// - Updating the queue and current outputters, including adding newcomers to the queue
 pub async fn run_frame(state: &mut State, output: &UdpSocket) {
     // Assemble the data for this frame (done before queue update because data isn't stored for queued controllers)
-    let mut data = [0u8; 512];
+    let mut data = vec![0u8; state.output_channel_count];
     for (i, source) in state.outputters.iter().enumerate() {
         data[i * state.input_channel_count..(i + 1) * state.input_channel_count]
             .copy_from_slice(&source.data);
     }
     // Output the data
-    send_e131(&output, &data, 1, state.frame as u8)
-        .await
-        .unwrap();
+    for universe in 0..((state.output_channel_count + 509) / 510) {
+        let mut this_data = [0u8; 512];
+        let to_copy = (state.output_channel_count - universe * 510).min(510);
+        this_data[..to_copy].copy_from_slice(&data[universe * 510..][..to_copy]);
+        send_e131(&output, &this_data, universe as u16 + 1, state.frame as u8)
+            .await
+            .unwrap();
+    }
 
     // Remove any sources from the queue that have disconnected (last packet was more than `state.timeout` ago). Can't use `retain` because we need to remove from `state.sources` as well.
     let mut i = 0;
@@ -174,8 +179,8 @@ async fn send_e131(
     ];
     let mut packet = [0u8; 638];
     packet[..126].copy_from_slice(&packet_header);
-    packet[109..111].copy_from_slice(&universe.to_be_bytes());
     packet[111] = seq_number;
+    packet[113..115].copy_from_slice(&universe.to_be_bytes());
     packet[126..].copy_from_slice(data);
     socket.send(&packet).await
 }

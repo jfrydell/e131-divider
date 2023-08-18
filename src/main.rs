@@ -96,7 +96,7 @@ struct Args {
 /// The current state of all sources.
 #[derive(Debug, Serialize, Clone)]
 pub struct State {
-    /// A map from IP address to source positions (either `Queue` or `Outputting`). Used for quick lookup on incoming packets.
+    /// A map from IP address to source positions (either `Queue` or `Outputting`). Used for quick lookup on incoming packets. The port is set to 0 for equality checks.
     #[serde(skip)]
     sources: HashMap<SocketAddr, SourcePosition>,
     /// A queue of sources that are waiting to output.
@@ -169,6 +169,10 @@ impl State {
         );
         // Validate sources HashMap
         for (&addr, position) in &self.sources {
+            debug!(
+                "Validating source at addr {:?} with position {:?}",
+                addr, position
+            );
             match position {
                 SourcePosition::Queue(i) => {
                     debug_assert!(self.queue[*i].common.addr == addr)
@@ -231,7 +235,7 @@ impl OutputtingSource {
 /// The info we keep track of for all sources.
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceCommon {
-    /// The source's IP address.
+    /// The source's IP address, with port set to 0 for equality checks.
     addr: SocketAddr,
     /// The source's name, as sent in packets.
     name: String,

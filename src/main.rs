@@ -71,6 +71,7 @@ struct Args {
     help: bool,
     #[options(
         help = "The IP address to output to",
+        required,
         default = "127.0.0.1:5568",
         short = "o"
     )]

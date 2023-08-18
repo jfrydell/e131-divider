@@ -36,8 +36,10 @@ fn handle_input(state: &mut State, mut addr: SocketAddr, data: Vec<u8>) {
             // Get universe offset and amount of data to copy (min of source_state length (in universe) and data length)
             let offset = universe.saturating_sub(1) * 510;
             let to_copy = (source_state.data.len().saturating_sub(offset)).min(data.len());
-            // Copy data, offsetting by universe in source_state's data
-            source_state.data[offset..][..to_copy].copy_from_slice(&data[..to_copy]);
+            // Copy data if there is data to copy, offsetting by universe in source_state's data
+            if to_copy > 0 {
+                source_state.data[offset..][..to_copy].copy_from_slice(&data[..to_copy]);
+            }
         }
         Some(SourcePosition::Queue(i)) => {
             let source_state = &mut state.queue[*i];

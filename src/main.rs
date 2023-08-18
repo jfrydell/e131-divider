@@ -32,7 +32,7 @@ async fn main() {
     tokio::spawn(input::handle_incoming(state.clone(), e131_socket));
     // Setup output
     let output_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    output_socket.connect("192.168.168.200:5568").await.unwrap();
+    output_socket.connect(opts.output_ip).await.unwrap();
 
     // Run the main loop
     let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / opts.fps));
@@ -69,15 +69,25 @@ async fn main() {
 struct Args {
     #[options(help = "Prints help information")]
     help: bool,
+    #[options(
+        help = "The IP address to output to",
+        default = "127.0.0.1:5568",
+        short = "o"
+    )]
+    output_ip: SocketAddr,
     #[options(help = "The number of output channels to use", required, short = "c")]
     output_channels: usize,
-    #[options(help = "The size of an indivisible group of channels", default = "3")]
+    #[options(
+        help = "The size of an indivisible group of channels",
+        default = "3",
+        short = "g"
+    )]
     group_size: usize,
-    #[options(help = "The framerate to run at", default = "20")]
+    #[options(help = "The framerate to run at", default = "20", short = "f")]
     fps: f64,
-    #[options(help = "The inactivity timeout in seconds", default = "2")]
+    #[options(help = "The inactivity timeout in seconds", default = "2", short = "t")]
     timeout: f64,
-    #[options(help = "The output timeout in seconds", default = "20")]
+    #[options(help = "The output timeout in seconds", default = "20", short = "T")]
     output_time: f64,
     #[options(help = "The maximum number of outputters", default = "2", short = "n")]
     outputter_capacity: usize,

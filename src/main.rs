@@ -120,7 +120,6 @@ pub struct State {
     /// The current frame counter.
     frame: usize,
     /// The time (in seconds) it took to run the last frame on the main thread. If this reaches 1/FPS, lock contention between the main thread and the input thread will occur.
-    #[serde(skip)]
     frame_time: f64,
 }
 impl State {
@@ -172,10 +171,20 @@ impl State {
         for (id, position) in &self.sources {
             match position {
                 SourcePosition::Queue(i) => {
-                    debug_assert!(&self.queue[*i].id == id)
+                    debug_assert!(
+                        &self.queue[*i].id == id,
+                        "Queue: {:?}, Sources: {:?}",
+                        self.queue,
+                        self.sources
+                    )
                 }
                 SourcePosition::Outputting(i) => {
-                    debug_assert!(&self.outputters[*i].id == id)
+                    debug_assert!(
+                        &self.outputters[*i].id == id,
+                        "Outputters: {:?}, Sources: {:?}",
+                        self.outputters,
+                        self.sources
+                    )
                 }
             }
         }
